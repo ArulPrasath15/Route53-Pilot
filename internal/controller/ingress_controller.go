@@ -71,7 +71,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	})
 	if err != nil {
 		log.Info("Failed to create AWS session")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, nil
 	}
 
 	r53 := route53.New(sess)
@@ -80,12 +80,12 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	hostedZoneID, err := r.findHostedZoneID(r53, domainName)
 	if err != nil {
 		log.Info("Failed to find hosted zone ID")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, nil
 	}
 
 	lbIP, err := r.getLoadBalancerIP(ctx, &ingress)
 	if err != nil {
-		log.Info("Failed to get LoadBalancer IP")
+		log.Info("Waiting to get LoadBalancer IP")
 		return ctrl.Result{}, nil
 	}
 	if lbIP == "" {
@@ -110,15 +110,15 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if err := r.createOrUpdateDNSRecord(r53, hostedZoneID, recordName, lbIP, action); err != nil {
 		log.Info("Failed to manage Route 53 record")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, nil
 	}
 
 	if !ingress.ObjectMeta.DeletionTimestamp.IsZero() {
 		ingress.ObjectMeta.Finalizers = removeString(ingress.ObjectMeta.Finalizers, "route53pilot/finalizer")
 		if err := r.Update(ctx, &ingress); err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, nil
 		}
-		log.Info("Record deleted successfully")
+		log.Info("DNS Record deleted successfully")
 		return ctrl.Result{}, nil
 	}
 	log.Info("Successfully recorded DNS entry")
@@ -143,7 +143,7 @@ func (r *IngressReconciler) findHostedZoneID(r53 *route53.Route53, domainName st
 
 func (r *IngressReconciler) getLoadBalancerIP(ctx context.Context, ingress *networkingv1.Ingress) (string, error) {
 	if len(ingress.Status.LoadBalancer.Ingress) == 0 {
-		return "", fmt.Errorf("no LoadBalancer IP found for Ingress")
+		return "", fmt.Errorf("waiting to get LoadBalancer IP for Ingress")
 	}
 	ip := ingress.Status.LoadBalancer.Ingress[0].IP
 	var hostname string
