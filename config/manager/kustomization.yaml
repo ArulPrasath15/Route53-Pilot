@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: arulprasath/route53pilot
-  newTag: tag
+  newTag: latest

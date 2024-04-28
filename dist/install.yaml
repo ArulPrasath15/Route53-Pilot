@@ -277,7 +277,8 @@ spec:
         - --leader-elect
         command:
         - /manager
-        image: arulprasath/route53pilot:new
+        image: arulprasath/route53pilot:latest
+        imagePullPolicy: Always
         livenessProbe:
           httpGet:
             path: /healthz

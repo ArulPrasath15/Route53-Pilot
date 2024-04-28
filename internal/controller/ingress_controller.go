@@ -31,12 +31,15 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var ingress networkingv1.Ingress
 	if err := r.Get(ctx, req.NamespacedName, &ingress); err != nil {
-		log.Info("Failed to get Ingress")
-		// log.Info(ingress.GetDeletionTimestamp().GoString())
+		log.Info("Ingress deleted")
 		return ctrl.Result{}, nil
 	}
 
-	// TODO Handle wait for hostname
+	// Check if the ingress is being deleted and if the finalizer is not present
+	if !ingress.ObjectMeta.DeletionTimestamp.IsZero() && !containsString(ingress.ObjectMeta.Finalizers, "route53pilot/finalizer") {
+		log.Info("Ingress Deleting", "name", ingress.Name, "namespace", ingress.Namespace)
+		return ctrl.Result{}, nil
+	}
 
 	// Fetch domain name from annotation
 	domainName := ingress.Annotations["route53.kubernetes.io/domain-name"]
@@ -44,7 +47,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Info("Domain name annotation missing")
 		return ctrl.Result{}, nil
 	}
-	if isValidDNSName("DOMAIN", domainName) == false {
+	if !isValidDNSName("DOMAIN", domainName) {
 		log.Info("Invalid domain name")
 		return ctrl.Result{}, nil
 	}
@@ -79,6 +82,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Retrieve the hosted zone ID using the domain name
 	hostedZoneID, err := r.findHostedZoneID(r53, domainName)
 	if err != nil {
+		log.Info(err.Error())
 		log.Info("Failed to find hosted zone ID")
 		return ctrl.Result{}, nil
 	}
@@ -121,7 +125,11 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Info("DNS Record deleted successfully")
 		return ctrl.Result{}, nil
 	}
-	log.Info("Successfully recorded DNS entry")
+
+	if action == "UPSERT" {
+		log.Info("Successfully created DNS entry")
+		return ctrl.Result{}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
