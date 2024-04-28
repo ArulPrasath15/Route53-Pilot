@@ -21,7 +21,7 @@ jobs:
 
     - name: Run Makefile targets
       run: |
-        make docker-buildx IMG=${{ secrets.DOCKER_USERNAME }}/route53pilot:latest
+        make docker-buildx IMG=${{ secrets.DOCKER_USERNAME }}/route53pilot TAG=${{ github.sha }}
 
     - name: Logout from Docker
       if: always()
