@@ -2,6 +2,7 @@ package ingressController
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 
@@ -127,6 +128,29 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if action == "UPSERT" {
+
+		annotationMap := map[string]interface{}{
+			"domain-name":    domainName,
+			"subdomain-name": subDomainName,
+			"region":         region,
+		}
+		annotationValue, err := json.Marshal(annotationMap)
+		if err != nil {
+			panic(err)
+		}
+
+		currentAnnotations := ingress.ObjectMeta.Annotations
+		if currentAnnotations == nil {
+			currentAnnotations = make(map[string]string)
+		}
+
+		currentAnnotations["route53pilot/last-applied-configuration"] = string(annotationValue)
+		ingress.ObjectMeta.Annotations = currentAnnotations
+
+		if err := r.Update(ctx, &ingress); err != nil {
+			return ctrl.Result{}, nil
+		}
+
 		log.Info("Successfully created DNS entry")
 		return ctrl.Result{}, nil
 	}
