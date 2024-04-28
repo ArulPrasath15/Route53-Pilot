@@ -3,6 +3,7 @@ package ingressController
 import (
 	"context"
 	"fmt"
+	"regexp"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,52 +26,26 @@ type IngressReconciler struct {
 //+kubebuilder:rbac:groups=networking.k8s.io.route53pilot,resources=ingresses/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=networking.k8s.io.route53pilot,resources=ingresses/finalizers,verbs=update
 
-func containsString(slice []string, str string) bool {
-	for _, s := range slice {
-		if s == str {
-			return true
-		}
-	}
-	return false
-}
-
-func removeString(slice []string, s string) []string {
-	for i, v := range slice {
-		if v == s {
-			return append(slice[:i], slice[i+1:]...)
-		}
-	}
-	return slice
-}
-
 func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
 	var ingress networkingv1.Ingress
 	if err := r.Get(ctx, req.NamespacedName, &ingress); err != nil {
-		log.Error(err, "Failed to get Ingress")
+		log.Info("Failed to get Ingress")
 		// log.Info(ingress.GetDeletionTimestamp().GoString())
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, nil
 	}
 
-	// Check if the Ingress is being deleted
-	if !ingress.GetDeletionTimestamp().IsZero() {
-		// Ingress is in the process of being deleted
-		annotations := ingress.GetAnnotations()
-		log.Info("Ingress is being deleted", "annotations", annotations)
-
-		// Example: Process or log a specific annotation
-		if value, exists := annotations["your-annotation-key"]; exists {
-			log.Info("Annotation value", "your-annotation-key", value)
-		}
-	}
-	// TODO Add validation for required annotations
 	// TODO Handle wait for hostname
 
 	// Fetch domain name from annotation
 	domainName := ingress.Annotations["route53.kubernetes.io/domain-name"]
 	if domainName == "" {
 		log.Info("Domain name annotation missing")
+		return ctrl.Result{}, nil
+	}
+	if isValidDNSName("DOMAIN", domainName) == false {
+		log.Info("Invalid domain name")
 		return ctrl.Result{}, nil
 	}
 
@@ -86,12 +61,16 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Info("Subdomain name annotation missing")
 		return ctrl.Result{}, nil
 	}
+	if !isValidDNSName("SUBDOMAIN", subDomainName) {
+		log.Info("Invalid subdomain name")
+		return ctrl.Result{}, nil
+	}
 
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(region),
 	})
 	if err != nil {
-		log.Error(err, "Failed to create AWS session")
+		log.Info("Failed to create AWS session")
 		return ctrl.Result{}, err
 	}
 
@@ -100,14 +79,18 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Retrieve the hosted zone ID using the domain name
 	hostedZoneID, err := r.findHostedZoneID(r53, domainName)
 	if err != nil {
-		log.Error(err, "Failed to find hosted zone ID")
+		log.Info("Failed to find hosted zone ID")
 		return ctrl.Result{}, err
 	}
 
 	lbIP, err := r.getLoadBalancerIP(ctx, &ingress)
 	if err != nil {
-		log.Error(err, "Failed to get LoadBalancer IP")
-		return ctrl.Result{}, err
+		log.Info("Failed to get LoadBalancer IP")
+		return ctrl.Result{}, nil
+	}
+	if lbIP == "" {
+		log.Info("Waiting to get the LoadBalancer IP")
+		return ctrl.Result{}, nil
 	}
 
 	action := "UPSERT"
@@ -126,7 +109,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	recordName := subDomainName + "." + domainName
 
 	if err := r.createOrUpdateDNSRecord(r53, hostedZoneID, recordName, lbIP, action); err != nil {
-		log.Error(err, "Failed to manage Route 53 record")
+		log.Info("Failed to manage Route 53 record")
 		return ctrl.Result{}, err
 	}
 
@@ -135,10 +118,10 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.Update(ctx, &ingress); err != nil {
 			return ctrl.Result{}, err
 		}
+		log.Info("Record deleted successfully")
 		return ctrl.Result{}, nil
 	}
-
-	log.Info("Successfully managed Route 53 record")
+	log.Info("Successfully recorded DNS entry")
 	return ctrl.Result{}, nil
 }
 
@@ -200,4 +183,37 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
 		Complete(r)
+}
+
+func containsString(slice []string, str string) bool {
+	for _, s := range slice {
+		if s == str {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(slice []string, s string) []string {
+	for i, v := range slice {
+		if v == s {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
+}
+
+func isValidDNSName(domainType string, name string) bool {
+	if len(name) > 255 {
+		return false
+	}
+	// Pattern to match each part of DNS (subdomains + top-level domain)
+	if domainType == "SUBDOMAIN" {
+		dnsPattern := `^[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*$`
+		matched, _ := regexp.MatchString(dnsPattern, name)
+		return matched
+	}
+	dnsPattern := `^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`
+	matched, _ := regexp.MatchString(dnsPattern, name)
+	return matched
 }
