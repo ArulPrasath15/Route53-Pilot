@@ -51,13 +51,16 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Info(err.Error())
 		return ctrl.Result{}, nil
 	}
-
+	log.Info("Ingress detected")
 	// Create a new AWS session
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(ingressAnnotation.region),
 	})
 	if err != nil {
 		log.Info("Failed to create AWS session for region: " + ingressAnnotation.region)
+		return ctrl.Result{}, nil
+	}
+	if !ingressAnnotation.detechChange && ingress.ObjectMeta.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
 
@@ -85,8 +88,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		recordName := ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})["subdomain-name"].(string) + "." + ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})["domain-name"].(string) + "."
 		hostedZoneID := ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})["hosted-zone-id"].(string)
 		recordValue := ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})["record-value"].(string)
-		log.Info("recordName: " + recordName)
-		log.Info("hostedZoneID: " + hostedZoneID)
 		if err := r.createOrUpdateDNSRecord(r53, hostedZoneID, recordName, recordValue, "DELETE"); err != nil {
 			log.Info(err.Error())
 			log.Info("Failed to delete the existing DNS record")
@@ -101,13 +102,11 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	recordName := ingressAnnotation.subDomainName + "." + ingressAnnotation.domainName
-
 	// Create or update the DNS record
 	if err := r.createOrUpdateDNSRecord(r53, hostedZoneID, recordName, lbIP, action); err != nil {
 		log.Info("Failed to manage Route 53 record")
 		return ctrl.Result{}, nil
 	}
-
 	// Add finalizer to the Ingress
 	if ingress.ObjectMeta.DeletionTimestamp.IsZero() && !containsString(ingress.ObjectMeta.Finalizers, "route53pilot/finalizer") {
 		ingress.ObjectMeta.Finalizers = append(ingress.ObjectMeta.Finalizers, "route53pilot/finalizer")
@@ -115,7 +114,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 	}
-
 	// Remove finalizer from the Ingress for Deletion
 	if !ingress.ObjectMeta.DeletionTimestamp.IsZero() {
 		ingress.ObjectMeta.Finalizers = removeString(ingress.ObjectMeta.Finalizers, "route53pilot/finalizer")
@@ -125,7 +123,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Info("DNS Record deleted successfully")
 		return ctrl.Result{}, nil
 	}
-
 	// Update the last-applied-configuration annotation
 	if action == "UPSERT" {
 		annotationMap := map[string]interface{}{
@@ -139,19 +136,15 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err != nil {
 			panic(err)
 		}
-
 		currentAnnotations := ingress.ObjectMeta.Annotations
 		if currentAnnotations == nil {
 			currentAnnotations = make(map[string]string)
 		}
-
 		currentAnnotations["route53pilot/last-applied-configuration"] = string(annotationValue)
 		ingress.ObjectMeta.Annotations = currentAnnotations
-
 		if err := r.Update(ctx, &ingress); err != nil {
 			return ctrl.Result{}, nil
 		}
-
 		log.Info("Successfully created DNS entry")
 		return ctrl.Result{}, nil
 	}
@@ -216,8 +209,6 @@ func (r *IngressReconciler) getAnnotations(ingress *networkingv1.Ingress, ingres
 			if !ingress.ObjectMeta.DeletionTimestamp.IsZero() {
 				ingressAnnotation.detechChange = false
 				return true, nil
-			} else {
-				return false, fmt.Errorf("no changes in the configuration")
 			}
 		} else {
 			ingressAnnotation.detechChange = true
