@@ -25,3 +25,4 @@ go.work
 *.swp
 *.swo
 *~
+/cmd/__debug_bin3534367895
