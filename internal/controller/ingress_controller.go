@@ -23,90 +23,41 @@ type IngressReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+type IngressAnnotation struct {
+	activate                 string // Activate might be used to control whether the ingress is active or not
+	domainName               string // DomainName specifies the primary domain
+	subDomainName            string // SubDomainName specifies the sub-domain
+	region                   string // Region indicates the geographical region of the ingress
+	detechChange             bool   // DetectChanges indicates whether to detect changes in the configuration
+	lastAppliedConfiguration interface{}
+}
+
 //+kubebuilder:rbac:groups=networking.k8s.io.route53pilot,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=networking.k8s.io.route53pilot,resources=ingresses/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=networking.k8s.io.route53pilot,resources=ingresses/finalizers,verbs=update
-
-// TODO: Check if the last-applied-configuration annotation is present and if it matches the current configuration
-// else update the DNS record
 
 func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
 	var ingress networkingv1.Ingress
+	var ingressAnnotation IngressAnnotation
 	if err := r.Get(ctx, req.NamespacedName, &ingress); err != nil {
 		log.Info("Ingress deleted")
 		return ctrl.Result{}, nil
 	}
 
-	activate := ingress.Annotations["route53.kubernetes.io/activate"]
-	if activate != "true" {
+	check, err := r.getAnnotations(&ingress, &ingressAnnotation)
+	if err != nil && !check {
+		log.Info(err.Error())
 		return ctrl.Result{}, nil
-	}
-
-	last_applied_configuration := ingress.Annotations["route53pilot/last-applied-configuration"]
-	data := make(map[string]interface{})
-
-	// Unmarshal the JSON string into the map
-	err := json.Unmarshal([]byte(last_applied_configuration), &data)
-	if err != nil {
-		log.Info("Failed to unmarshal last-applied-configuration")
-		return ctrl.Result{}, nil
-	}
-	last_applied_configuration_DomainName := data["domain-name"]
-	last_applied_configuration_SubDomainName := data["subdomain-name"]
-	last_applied_configuration_Region := data["region"]
-
-	// Check if the last-applied-configuration annotation is present and if it matches the current configuration
-	if last_applied_configuration_DomainName == ingress.Annotations["route53.kubernetes.io/domain-name"] &&
-		last_applied_configuration_SubDomainName == ingress.Annotations["route53.kubernetes.io/subdomain-name"] &&
-		last_applied_configuration_Region == ingress.Annotations["route53.kubernetes.io/region"] {
-		log.Info("Last-applied-configuration matches the current configuration")
-		return ctrl.Result{}, nil
-	}
-
-	// log.Info("Ingress identified for Route 53 management " + ingress.Name)
-
-	// // Check if the ingress is being deleted and if the finalizer is not present
-	// if !ingress.ObjectMeta.DeletionTimestamp.IsZero() && !containsString(ingress.ObjectMeta.Finalizers, "route53pilot/finalizer") {
-	// 	log.Info("Ingress deleting")
-	// 	return ctrl.Result{}, nil
-	// }
-
-	// Fetch domain name from annotation
-	domainName := ingress.Annotations["route53.kubernetes.io/domain-name"]
-	if domainName == "" {
-		log.Info("Domain name annotation missing")
-		return ctrl.Result{}, nil
-	}
-	if !isValidDNSName("DOMAIN", domainName) {
-		log.Info("Invalid domain name")
-		return ctrl.Result{}, nil
-	}
-
-	// Fetch subdomain from annotation
-	subDomainName := ingress.Annotations["route53.kubernetes.io/subdomain-name"]
-	if subDomainName == "" {
-		log.Info("Subdomain name annotation missing")
-		return ctrl.Result{}, nil
-	}
-	if !isValidDNSName("SUBDOMAIN", subDomainName) {
-		log.Info("Invalid subdomain name")
-		return ctrl.Result{}, nil
-	}
-
-	// Fetch region from annotation or default to us-east-1
-	region := ingress.Annotations["route53.kubernetes.io/region"]
-	if region == "" {
-		region = "us-east-1"
 	}
 
 	// Create a new AWS session
 	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String(region),
+		Region: aws.String(ingressAnnotation.region),
 	})
 	if err != nil {
-		log.Info("Failed to create AWS session")
+		log.Info("Failed to create AWS session for region: " + ingressAnnotation.region)
 		return ctrl.Result{}, nil
 	}
 
@@ -114,10 +65,10 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	r53 := route53.New(sess)
 
 	// Retrieve the hosted zone ID using the domain name
-	hostedZoneID, err := r.findHostedZoneID(r53, domainName)
+	hostedZoneID, err := r.findHostedZoneID(r53, ingressAnnotation.domainName)
 	if err != nil {
 		log.Info(err.Error())
-		log.Info(fmt.Sprintf("Failed to find hosted zone ID for %s", domainName))
+		log.Info(fmt.Sprintf("Failed to find hosted zone ID for %s", ingressAnnotation.domainName))
 		return ctrl.Result{}, nil
 	}
 
@@ -128,13 +79,28 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	if ingressAnnotation.detechChange {
+		log.Info("Detected changes in the configuration")
+		// Delete the existing DNS record
+		recordName := ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})["subdomain-name"].(string) + "." + ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})["domain-name"].(string) + "."
+		hostedZoneID := ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})["hosted-zone-id"].(string)
+		recordValue := ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})["record-value"].(string)
+		log.Info("recordName: " + recordName)
+		log.Info("hostedZoneID: " + hostedZoneID)
+		if err := r.createOrUpdateDNSRecord(r53, hostedZoneID, recordName, recordValue, "DELETE"); err != nil {
+			log.Info(err.Error())
+			log.Info("Failed to delete the existing DNS record")
+			return ctrl.Result{}, nil
+		}
+	}
+
 	action := "UPSERT"
 	if !ingress.ObjectMeta.DeletionTimestamp.IsZero() {
 		log.Info("Ingress is being deleted")
 		action = "DELETE"
 	}
 
-	recordName := subDomainName + "." + domainName
+	recordName := ingressAnnotation.subDomainName + "." + ingressAnnotation.domainName
 
 	// Create or update the DNS record
 	if err := r.createOrUpdateDNSRecord(r53, hostedZoneID, recordName, lbIP, action); err != nil {
@@ -163,9 +129,11 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Update the last-applied-configuration annotation
 	if action == "UPSERT" {
 		annotationMap := map[string]interface{}{
-			"domain-name":    domainName,
-			"subdomain-name": subDomainName,
-			"region":         region,
+			"domain-name":    ingressAnnotation.domainName,
+			"subdomain-name": ingressAnnotation.subDomainName,
+			"region":         ingressAnnotation.region,
+			"hosted-zone-id": hostedZoneID,
+			"record-value":   lbIP,
 		}
 		annotationValue, err := json.Marshal(annotationMap)
 		if err != nil {
@@ -188,6 +156,74 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *IngressReconciler) getAnnotations(ingress *networkingv1.Ingress, ingressAnnotation *IngressAnnotation) (bool, error) {
+	log := log.FromContext(context.TODO())
+
+	last_applied_configuration := ingress.Annotations["route53pilot/last-applied-configuration"]
+	last_applied_configuration_data := make(map[string]interface{})
+	if last_applied_configuration != "" {
+		err := json.Unmarshal([]byte(last_applied_configuration), &last_applied_configuration_data)
+		if err != nil {
+			log.Info("Failed to unmarshal last-applied-configuration")
+			ingressAnnotation.lastAppliedConfiguration = nil
+		}
+		ingressAnnotation.lastAppliedConfiguration = last_applied_configuration_data
+	} else {
+		ingressAnnotation.lastAppliedConfiguration = nil
+	}
+
+	ingressAnnotation.activate = ingress.Annotations["route53.kubernetes.io/activate"]
+	ingressAnnotation.domainName = ingress.Annotations["route53.kubernetes.io/domain-name"]
+	ingressAnnotation.subDomainName = ingress.Annotations["route53.kubernetes.io/subdomain-name"]
+	ingressAnnotation.region = ingress.Annotations["route53.kubernetes.io/region"]
+
+	// Check if the activate annotation is set to true
+	activate := ingress.Annotations["route53.kubernetes.io/activate"]
+	if activate != "true" {
+		return false, fmt.Errorf("Route53 Pilot not activated")
+	}
+
+	// Fetch domain name from annotation
+	domainName := ingress.Annotations["route53.kubernetes.io/domain-name"]
+	if domainName == "" {
+		return false, fmt.Errorf("domain name annotation missing")
+	}
+	if !isValidDNSName("DOMAIN", domainName) {
+		return false, fmt.Errorf("invalid domain name")
+	}
+	// Fetch subdomain from annotation
+	subDomainName := ingress.Annotations["route53.kubernetes.io/subdomain-name"]
+	if subDomainName == "" {
+		return false, fmt.Errorf("subdomain name annotation missing")
+	}
+	if !isValidDNSName("SUBDOMAIN", subDomainName) {
+		return false, fmt.Errorf("invalid subdomain name")
+	}
+	// Fetch region from annotation or default to us-east-1
+	region := ingress.Annotations["route53.kubernetes.io/region"]
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	if ingressAnnotation.lastAppliedConfiguration != nil {
+		lastAppliedConfig, ok := ingressAnnotation.lastAppliedConfiguration.(map[string]interface{})
+		if !ok {
+			return false, fmt.Errorf("invalid last-applied-configuration format")
+		}
+		if lastAppliedConfig["domain-name"] == domainName && lastAppliedConfig["subdomain-name"] == subDomainName && lastAppliedConfig["region"] == region {
+			if !ingress.ObjectMeta.DeletionTimestamp.IsZero() {
+				ingressAnnotation.detechChange = false
+				return true, nil
+			} else {
+				return false, fmt.Errorf("no changes in the configuration")
+			}
+		} else {
+			ingressAnnotation.detechChange = true
+		}
+	}
+	return true, nil
 }
 
 func (r *IngressReconciler) findHostedZoneID(r53 *route53.Route53, domainName string) (string, error) {
